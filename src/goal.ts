@@ -4,6 +4,7 @@ import { GoalCommandController } from "./commands.js";
 import { registerGoalLifecycle } from "./lifecycle.js";
 import { GoalRunController } from "./run-protocol.js";
 import { GoalRuntime } from "./runtime.js";
+import { GoalStateController } from "./state-protocol.js";
 import { registerGoalTools } from "./tools.js";
 
 interface GoalOptions {
@@ -14,13 +15,15 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
   const runtime = new GoalRuntime(pi);
   const commands = new GoalCommandController(runtime);
   const runController = new GoalRunController(runtime, commands);
+  const stateController = new GoalStateController(runtime, commands);
 
   // Keep registration order explicit: managed-run bus listeners exist before tools,
   // command routing, and session lifecycle bind the per-factory runtime.
   runController.register(pi);
+  stateController.register(pi);
   registerGoalTools(pi, runtime);
   registerGoalCommand(pi, runtime, commands, options);
-  registerGoalLifecycle(pi, runtime, runController, commands, options);
+  registerGoalLifecycle(pi, runtime, runController, commands, stateController, options);
 }
 
 export default function goal(pi: ExtensionAPI, options: GoalOptions = {}) {

@@ -25,6 +25,10 @@ import {
   transitionGoal,
 } from "./runtime.js";
 
+export type GoalResumeResult =
+  | { ok: true; resumedGoalId: string }
+  | { ok: false; code: "NO_GOAL" | "NOT_RESUMABLE" | "BUDGET_EXHAUSTED" | "WORKFLOW_BUSY" | "TOOLS_UNAVAILABLE" | "SUPERSEDED" | "ACTIVATION_FAILED" };
+
 // User-command mutations are kept separate from Pi event wiring. Every controller
 // receives exactly one per-factory GoalRuntime, preserving session isolation.
 export class GoalCommandController {
@@ -200,14 +204,18 @@ export class GoalCommandController {
     if (stoppedGoal) notifyTerminal(ctx.ui, `Goal paused: ${stoppedGoal.text}`, "info");
   }
 
-  async resumeGoal(ctx: StatusContext) {
+  async resumeGoal(
+    ctx: StatusContext,
+    isRequestCurrent: () => boolean = () => true,
+    isSessionCurrent: () => boolean = () => true,
+  ): Promise<GoalResumeResult> {
+    if (!isRequestCurrent()) return { ok: false, code: "SUPERSEDED" };
     if (!this.runtime.activeGoal) {
       notifyTerminal(ctx.ui, "No active goal.", "info");
-      return;
+      return { ok: false, code: "NO_GOAL" };
     }
     if (this.runtime.activeGoal.status === "active" && this.runtime.activeGoal.waiting) {
-      await this.resumeWaitingGoal(ctx);
-      return;
+      return this.resumeWaitingGoal(ctx, isRequestCurrent, isSessionCurrent);
     }
     if (!isResumableGoalStatus(this.runtime.activeGoal.status)) {
       notifyTerminal(
@@ -215,48 +223,58 @@ export class GoalCommandController {
         `Goal is ${this.runtime.activeGoal.status}; only paused, blocked, usage-limited, or budget-limited goals can be resumed.`,
         "warning",
       );
-      return;
+      return { ok: false, code: "NOT_RESUMABLE" };
     }
     if (
       this.runtime.activeGoal.tokenBudget !== undefined &&
       this.runtime.activeGoal.tokensUsed >= this.runtime.activeGoal.tokenBudget
     ) {
       notifyTerminal(ctx.ui, `Goal token budget is still reached: ${formatBudget(this.runtime.activeGoal)}`, "warning");
-      return;
+      return { ok: false, code: "BUDGET_EXHAUSTED" };
     }
+    const stoppedGoal = this.runtime.activeGoal;
     if (!this.runtime.acquireWorkflow(ctx.sessionManager)) {
       this.reportWorkflowBusy(ctx);
-      return;
+      return { ok: false, code: "WORKFLOW_BUSY" };
     }
     try {
       this.runtime.assertGoalToolsAvailable();
     } catch (error) {
       notifyTerminal(ctx.ui, `Cannot resume /goal: ${formatError(error)}`, "error");
       this.runtime.releaseWorkflow();
-      return;
+      return { ok: false, code: "TOOLS_UNAVAILABLE" };
     }
-    const stoppedGoal = this.runtime.activeGoal;
+    // Workflow acquisition emits synchronously to sibling extensions. Recheck
+    // the caller's observed state before rotating identity or clearing guards.
+    if (!isRequestCurrent() || this.runtime.activeGoal !== stoppedGoal) {
+      if (this.runtime.activeGoal === stoppedGoal) this.runtime.releaseWorkflow();
+      return { ok: false, code: "SUPERSEDED" };
+    }
     const stoppedStatus = stoppedGoal.status;
     this.runtime.cancelContinuationWork();
     this.runtime.clearGoalRecovery();
     this.runtime.clearBudgetWrapUp();
     this.runtime.clearStaleGoalToolCallBlock();
-    this.runtime.activeGoal = queueGoalSafetyReset(transitionGoal(nextGoalInstance(this.runtime.activeGoal), "active"));
-    this.runtime.persistGoal(this.runtime.activeGoal);
+    const resumedGoal = queueGoalSafetyReset(transitionGoal(nextGoalInstance(stoppedGoal), "active"));
+    this.runtime.activeGoal = resumedGoal;
+    this.runtime.persistGoal(resumedGoal);
+    if (this.runtime.activeGoal?.id !== resumedGoal.id) return { ok: false, code: "SUPERSEDED" };
     if (this.runtime.activeGoal.status !== "active") {
       this.runtime.updateStatus(ctx, this.runtime.activeGoal);
       this.runtime.releaseWorkflow();
       notifyTerminal(ctx.ui, `Goal token budget is still reached: ${formatBudget(this.runtime.activeGoal)}`, "warning");
-      return;
+      return { ok: false, code: "BUDGET_EXHAUSTED" };
     }
-    if (!this.runtime.ownsWorkflow(this.runtime.activeGoal)) return;
+    if (!this.runtime.ownsWorkflow(this.runtime.activeGoal)) return { ok: false, code: "SUPERSEDED" };
     this.runtime.updateStatus(ctx, this.runtime.activeGoal);
-    const resumedGoal = this.runtime.activeGoal;
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,
       buildResumePrompt(resumedGoal, stoppedStatus),
+      true,
+      isSessionCurrent,
     );
+    if (!isSessionCurrent()) return { ok: false, code: "SUPERSEDED" };
     if (!sent) {
       if (this.runtime.activeGoal?.id === resumedGoal.id && this.runtime.activeGoal.status === "active") {
         this.runtime.activeGoal = stoppedGoal;
@@ -267,9 +285,9 @@ export class GoalCommandController {
         }
         this.runtime.releaseWorkflow();
       }
-      return;
+      return { ok: false, code: "ACTIVATION_FAILED" };
     }
-    if (!this.runtime.ownsWorkflow(resumedGoal)) return;
+    if (!this.runtime.ownsWorkflow(resumedGoal)) return { ok: false, code: "SUPERSEDED" };
     const automaticLimit = this.runtime.settings.continuationLimits.automaticTurns;
     notifyTerminal(
       ctx.ui,
@@ -280,39 +298,54 @@ export class GoalCommandController {
       }`,
       automaticLimit === null ? "warning" : "info",
     );
+    // Pi's extension sendUserMessage API is void: acceptance is not delivery or inference completion.
+    return { ok: true, resumedGoalId: resumedGoal.id };
   }
 
-  private async resumeWaitingGoal(ctx: StatusContext) {
+  private async resumeWaitingGoal(
+    ctx: StatusContext,
+    isRequestCurrent: () => boolean,
+    isSessionCurrent: () => boolean,
+  ): Promise<GoalResumeResult> {
     const waitingGoal = this.runtime.activeGoal;
     const waiting = waitingGoal?.waiting;
-    if (waitingGoal?.status !== "active" || !waiting) return;
+    if (waitingGoal?.status !== "active" || !waiting) return { ok: false, code: "NOT_RESUMABLE" };
     if (!this.runtime.acquireWorkflow(ctx.sessionManager)) {
       this.reportWorkflowBusy(ctx);
-      return;
+      return { ok: false, code: "WORKFLOW_BUSY" };
     }
     try {
       this.runtime.assertGoalToolsAvailable();
     } catch (error) {
       notifyTerminal(ctx.ui, `Cannot resume /goal: ${formatError(error)}`, "error");
-      return;
+      return { ok: false, code: "TOOLS_UNAVAILABLE" };
     }
-    if (!this.runtime.clearGoalWait(ctx, waitingGoal.id)) return;
+    if (!isRequestCurrent() || this.runtime.activeGoal !== waitingGoal) return { ok: false, code: "SUPERSEDED" };
+    if (waitingGoal.tokenBudget !== undefined && waitingGoal.tokensUsed >= waitingGoal.tokenBudget) {
+      return { ok: false, code: "BUDGET_EXHAUSTED" };
+    }
+    if (!this.runtime.clearGoalWait(ctx, waitingGoal.id)) return { ok: false, code: "SUPERSEDED" };
     const resumedGoal = this.runtime.activeGoal;
-    if (!resumedGoal || resumedGoal.id !== waitingGoal.id || resumedGoal.status !== "active") return;
+    if (!resumedGoal || resumedGoal.id !== waitingGoal.id || resumedGoal.status !== "active") {
+      return { ok: false, code: "SUPERSEDED" };
+    }
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,
       buildWaitingResumePrompt(resumedGoal, waiting.reason),
       false,
+      isSessionCurrent,
     );
+    if (!isSessionCurrent()) return { ok: false, code: "SUPERSEDED" };
     if (!sent) {
       if (this.runtime.activeGoal?.id === waitingGoal.id) {
         this.runtime.enterGoalWait(ctx, waitingGoal.id, waiting);
       }
-      return;
+      return { ok: false, code: "ACTIVATION_FAILED" };
     }
-    if (!this.runtime.ownsWorkflow(resumedGoal)) return;
+    if (!this.runtime.ownsWorkflow(resumedGoal)) return { ok: false, code: "SUPERSEDED" };
     notifyTerminal(ctx.ui, `Goal resumed from waiting: ${waitingGoal.text}`, "info");
+    return { ok: true, resumedGoalId: resumedGoal.id };
   }
 
   clearGoal(ctx: StatusContext) {

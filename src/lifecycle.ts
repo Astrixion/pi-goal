@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { currentTokenTotal } from "./accounting.js";
 import { notifyTerminal } from "./errors.js";
 import {
@@ -28,6 +28,7 @@ import {
 } from "./runtime.js";
 import { hasAssistantToolCall } from "./safety.js";
 import { DEFAULT_GOAL_SETTINGS, readGoalSettings } from "./settings.js";
+import type { GoalStateController } from "./state-protocol.js";
 
 const REMOVED_QUEUE_SETTING_WARNING =
   "Ordered goal queue has been removed. Use /goal edit to reprioritize an active objective, or start /goal <objectives> if no active goal exists.";
@@ -43,6 +44,7 @@ export function registerGoalLifecycle(
   runtime: GoalRuntime,
   runController: GoalRunController,
   commands: GoalCommandController,
+  stateController: GoalStateController,
   options: GoalLifecycleOptions = {},
 ) {
   // Pi invalidates this module's ExtensionContext when the session is replaced
@@ -53,6 +55,12 @@ export function registerGoalLifecycle(
   // never emitted (for example late extension loading).
   let sessionActive = true;
   pi.on("session_start", async (_event, ctx) => {
+    const sessionId = stateController.beginSession();
+    await restoreSession(ctx);
+    if (sessionActive) stateController.ready(ctx, sessionId);
+  });
+
+  async function restoreSession(ctx: ExtensionContext) {
     sessionActive = true;
     runtime.bindWorkflowSession(ctx.sessionManager);
     runtime.replaceMenuSession();
@@ -77,6 +85,9 @@ export function registerGoalLifecycle(
     runtime.legacyExperimentalGoalsSetting =
       settingsResult.kind !== "invalid" && settingsResult.legacyExperimentalGoals;
     runController.bindSession(ctx);
+    if (loaded.invalid) {
+      throw new Error("Saved Goal state is invalid; refusing to seed or resume work. Recover the session explicitly.");
+    }
 
     if (settingsResult.kind === "invalid") {
       notifyTerminal(ctx.ui, `pi-goal settings ignored: ${settingsResult.reason}. Using default settings.`, "warning");
@@ -85,10 +96,9 @@ export function registerGoalLifecycle(
       notifyTerminal(ctx.ui, REMOVED_QUEUE_SETTING_WARNING, "warning");
     }
 
-    // Astrixion patch: auto-start a standing goal from PI_GOAL_INITIAL when no
-    // active goal was restored. Once started it persists as active, so later
-    // session reloads take the restore branch below and do not re-start it.
-    if (loaded.goal?.status !== "active") {
+    // Never overwrite an operator stop/clear, completion, or unreadable saved
+    // record. Only a session with no Goal history may seed a standing goal.
+    if (!loaded.hasRecordedState) {
       const initialGoal = process.env.PI_GOAL_INITIAL?.trim();
       if (initialGoal) {
         await commands.startGoal(initialGoal, undefined, ctx);
@@ -99,6 +109,7 @@ export function registerGoalLifecycle(
     if (loaded.goal?.status === "active") {
       if (!runtime.acquireWorkflow()) {
         runtime.activeGoal = transitionGoal(loaded.goal, "paused");
+        runtime.activeGoal.stopCause = "workflow_busy";
         runtime.persistGoal(runtime.activeGoal);
         runtime.ensureInactiveGoalContextContract(ctx);
         runtime.updateStatus(ctx, runtime.activeGoal);
@@ -111,9 +122,15 @@ export function registerGoalLifecycle(
       }
       runtime.activeGoal = loaded.goal;
       if (runtime.activeGoal.safetyResetPending) {
-        // Resume/edit activation is persisted before its owned prompt starts. A
-        // reload must commit that promised reset before enforcing the old limits.
-        runtime.activeGoal = resetGoalSafetyEpoch(runtime.activeGoal);
+        // Acceptance is not prompt delivery. Recovery must not manufacture a
+        // new allowance for a resume/edit whose owned prompt never started.
+        runtime.stopActiveGoal(ctx, {
+          kind: "activation_rollback",
+          expectedGoalId: runtime.activeGoal.id,
+          restoreGoal: { ...runtime.activeGoal, safetyResetPending: undefined },
+          abortTurn: false,
+        });
+        return;
       }
       runtime.recordGoalUsage(runtime.activeGoal, ctx);
       if (runtime.limitActiveGoalForBudget(ctx, false)) return;
@@ -154,10 +171,11 @@ export function registerGoalLifecycle(
       runtime.ensureInactiveGoalContextContract(ctx);
       ctx.ui.setStatus(STATUS_KEY, undefined);
     }
-  });
+  }
 
   pi.on("session_shutdown", (_event, ctx) => {
     sessionActive = false;
+    stateController.shutdown();
     const shutdownSession = ctx.sessionManager;
     runController.unbindSession();
     runtime.closeMenuSession();
@@ -409,6 +427,26 @@ export function registerGoalLifecycle(
   pi.on("before_agent_start", (event, ctx) => {
     if (!sessionActive) return;
     runtime.clearAgentRun();
+    // Pi 1.3 also sends this boundary for custom-message turns, without a
+    // prompt. They are not Goal-owned user prompts and must not reset epochs.
+    if (event.messageType === "custom") {
+      if (runtime.hasActiveBudgetWrapUp() && runtime.activeGoal) {
+        runtime.beginAgentRun(runtime.activeGoal.id, "manual");
+        return goalContractBoundaryResult(ctx);
+      }
+      if (runtime.activeGoal?.status === "active" && !runtime.ownsWorkflow(runtime.activeGoal)) {
+        runtime.cancelContinuationWork();
+        runtime.clearGoalRecovery();
+        abortCurrentTurn(ctx);
+        return;
+      }
+      if (runtime.activeGoal?.waiting) runtime.clearGoalWait(ctx, runtime.activeGoal.id);
+      if (runtime.activeGoal?.status === "active" && runtime.ownsWorkflow(runtime.activeGoal)) {
+        runtime.beginAgentRun(runtime.activeGoal.id, "manual");
+        if (!runtime.goalToolsAvailable()) runtime.pauseGoalForUnavailableTools(ctx, false);
+      }
+      return goalContractBoundaryResult(ctx, runtime.activeGoal?.status === "active" ? runtime.activeGoal : undefined);
+    }
     // Pi-owned retries emit agent_start directly. Reaching a normal prompt
     // boundary means cleanup no longer owns the next run, so the hard-cap guard
     // must not abort it.

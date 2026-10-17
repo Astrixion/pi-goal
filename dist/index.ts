@@ -43,7 +43,7 @@ import {
   stoppedStatusLabel,
   transitionGoal,
   validateObjective
-} from "./chunks/chunk-7FMBWODN.ts";
+} from "./chunks/chunk-DSTRZ2SJ.ts";
 import {
   DEFAULT_GOAL_SETTINGS,
   currentTokenTotal,
@@ -63,7 +63,7 @@ import {
 
 // src/command-registration.ts
 function registerGoalCommand(pi, runtime, commands, options = {}) {
-  const loadGoalManager = cachedModuleLoader(options.loadGoalManager ?? (() => import("./chunks/menu-7W5HGHFO.ts")));
+  const loadGoalManager = cachedModuleLoader(options.loadGoalManager ?? (() => import("./chunks/menu-GVLAPH7N.ts")));
   const loadGoalSettings = cachedModuleLoader(options.loadGoalSettings ?? (() => import("./chunks/settings-ui-T77VFPTK.ts")));
   pi.registerCommand("goal", {
     description: "Run a goal to completion: /goal [--tokens 100k] <goal_to_complete>",
@@ -306,14 +306,14 @@ New goal: ${safeGoalMenuText(objective, 4e3)}`
     });
     if (stoppedGoal) notifyTerminal(ctx.ui, `Goal paused: ${stoppedGoal.text}`, "info");
   }
-  async resumeGoal(ctx) {
+  async resumeGoal(ctx, isRequestCurrent = () => true, isSessionCurrent = () => true) {
+    if (!isRequestCurrent()) return { ok: false, code: "SUPERSEDED" };
     if (!this.runtime.activeGoal) {
       notifyTerminal(ctx.ui, "No active goal.", "info");
-      return;
+      return { ok: false, code: "NO_GOAL" };
     }
     if (this.runtime.activeGoal.status === "active" && this.runtime.activeGoal.waiting) {
-      await this.resumeWaitingGoal(ctx);
-      return;
+      return this.resumeWaitingGoal(ctx, isRequestCurrent, isSessionCurrent);
     }
     if (!isResumableGoalStatus(this.runtime.activeGoal.status)) {
       notifyTerminal(
@@ -321,45 +321,53 @@ New goal: ${safeGoalMenuText(objective, 4e3)}`
         `Goal is ${this.runtime.activeGoal.status}; only paused, blocked, usage-limited, or budget-limited goals can be resumed.`,
         "warning"
       );
-      return;
+      return { ok: false, code: "NOT_RESUMABLE" };
     }
     if (this.runtime.activeGoal.tokenBudget !== void 0 && this.runtime.activeGoal.tokensUsed >= this.runtime.activeGoal.tokenBudget) {
       notifyTerminal(ctx.ui, `Goal token budget is still reached: ${formatBudget(this.runtime.activeGoal)}`, "warning");
-      return;
+      return { ok: false, code: "BUDGET_EXHAUSTED" };
     }
+    const stoppedGoal = this.runtime.activeGoal;
     if (!this.runtime.acquireWorkflow(ctx.sessionManager)) {
       this.reportWorkflowBusy(ctx);
-      return;
+      return { ok: false, code: "WORKFLOW_BUSY" };
     }
     try {
       this.runtime.assertGoalToolsAvailable();
     } catch (error) {
       notifyTerminal(ctx.ui, `Cannot resume /goal: ${formatError(error)}`, "error");
       this.runtime.releaseWorkflow();
-      return;
+      return { ok: false, code: "TOOLS_UNAVAILABLE" };
     }
-    const stoppedGoal = this.runtime.activeGoal;
+    if (!isRequestCurrent() || this.runtime.activeGoal !== stoppedGoal) {
+      if (this.runtime.activeGoal === stoppedGoal) this.runtime.releaseWorkflow();
+      return { ok: false, code: "SUPERSEDED" };
+    }
     const stoppedStatus = stoppedGoal.status;
     this.runtime.cancelContinuationWork();
     this.runtime.clearGoalRecovery();
     this.runtime.clearBudgetWrapUp();
     this.runtime.clearStaleGoalToolCallBlock();
-    this.runtime.activeGoal = queueGoalSafetyReset(transitionGoal(nextGoalInstance(this.runtime.activeGoal), "active"));
-    this.runtime.persistGoal(this.runtime.activeGoal);
+    const resumedGoal = queueGoalSafetyReset(transitionGoal(nextGoalInstance(stoppedGoal), "active"));
+    this.runtime.activeGoal = resumedGoal;
+    this.runtime.persistGoal(resumedGoal);
+    if (this.runtime.activeGoal?.id !== resumedGoal.id) return { ok: false, code: "SUPERSEDED" };
     if (this.runtime.activeGoal.status !== "active") {
       this.runtime.updateStatus(ctx, this.runtime.activeGoal);
       this.runtime.releaseWorkflow();
       notifyTerminal(ctx.ui, `Goal token budget is still reached: ${formatBudget(this.runtime.activeGoal)}`, "warning");
-      return;
+      return { ok: false, code: "BUDGET_EXHAUSTED" };
     }
-    if (!this.runtime.ownsWorkflow(this.runtime.activeGoal)) return;
+    if (!this.runtime.ownsWorkflow(this.runtime.activeGoal)) return { ok: false, code: "SUPERSEDED" };
     this.runtime.updateStatus(ctx, this.runtime.activeGoal);
-    const resumedGoal = this.runtime.activeGoal;
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,
-      buildResumePrompt(resumedGoal, stoppedStatus)
+      buildResumePrompt(resumedGoal, stoppedStatus),
+      true,
+      isSessionCurrent
     );
+    if (!isSessionCurrent()) return { ok: false, code: "SUPERSEDED" };
     if (!sent) {
       if (this.runtime.activeGoal?.id === resumedGoal.id && this.runtime.activeGoal.status === "active") {
         this.runtime.activeGoal = stoppedGoal;
@@ -370,47 +378,57 @@ New goal: ${safeGoalMenuText(objective, 4e3)}`
         }
         this.runtime.releaseWorkflow();
       }
-      return;
+      return { ok: false, code: "ACTIVATION_FAILED" };
     }
-    if (!this.runtime.ownsWorkflow(resumedGoal)) return;
+    if (!this.runtime.ownsWorkflow(resumedGoal)) return { ok: false, code: "SUPERSEDED" };
     const automaticLimit = this.runtime.settings.continuationLimits.automaticTurns;
     notifyTerminal(
       ctx.ui,
       `Goal resumed from ${stoppedStatusLabel(stoppedStatus)}: ${resumedGoal.text}. ${automaticLimit === null ? "Automatic work remains Unlimited; goal progress and cumulative usage are preserved." : `The automatic-work counter will reset to 0 of ${automaticLimit} when the resumed prompt starts; goal progress and cumulative usage are preserved.`}`,
       automaticLimit === null ? "warning" : "info"
     );
+    return { ok: true, resumedGoalId: resumedGoal.id };
   }
-  async resumeWaitingGoal(ctx) {
+  async resumeWaitingGoal(ctx, isRequestCurrent, isSessionCurrent) {
     const waitingGoal = this.runtime.activeGoal;
     const waiting = waitingGoal?.waiting;
-    if (waitingGoal?.status !== "active" || !waiting) return;
+    if (waitingGoal?.status !== "active" || !waiting) return { ok: false, code: "NOT_RESUMABLE" };
     if (!this.runtime.acquireWorkflow(ctx.sessionManager)) {
       this.reportWorkflowBusy(ctx);
-      return;
+      return { ok: false, code: "WORKFLOW_BUSY" };
     }
     try {
       this.runtime.assertGoalToolsAvailable();
     } catch (error) {
       notifyTerminal(ctx.ui, `Cannot resume /goal: ${formatError(error)}`, "error");
-      return;
+      return { ok: false, code: "TOOLS_UNAVAILABLE" };
     }
-    if (!this.runtime.clearGoalWait(ctx, waitingGoal.id)) return;
+    if (!isRequestCurrent() || this.runtime.activeGoal !== waitingGoal) return { ok: false, code: "SUPERSEDED" };
+    if (waitingGoal.tokenBudget !== void 0 && waitingGoal.tokensUsed >= waitingGoal.tokenBudget) {
+      return { ok: false, code: "BUDGET_EXHAUSTED" };
+    }
+    if (!this.runtime.clearGoalWait(ctx, waitingGoal.id)) return { ok: false, code: "SUPERSEDED" };
     const resumedGoal = this.runtime.activeGoal;
-    if (!resumedGoal || resumedGoal.id !== waitingGoal.id || resumedGoal.status !== "active") return;
+    if (!resumedGoal || resumedGoal.id !== waitingGoal.id || resumedGoal.status !== "active") {
+      return { ok: false, code: "SUPERSEDED" };
+    }
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,
       buildWaitingResumePrompt(resumedGoal, waiting.reason),
-      false
+      false,
+      isSessionCurrent
     );
+    if (!isSessionCurrent()) return { ok: false, code: "SUPERSEDED" };
     if (!sent) {
       if (this.runtime.activeGoal?.id === waitingGoal.id) {
         this.runtime.enterGoalWait(ctx, waitingGoal.id, waiting);
       }
-      return;
+      return { ok: false, code: "ACTIVATION_FAILED" };
     }
-    if (!this.runtime.ownsWorkflow(resumedGoal)) return;
+    if (!this.runtime.ownsWorkflow(resumedGoal)) return { ok: false, code: "SUPERSEDED" };
     notifyTerminal(ctx.ui, `Goal resumed from waiting: ${waitingGoal.text}`, "info");
+    return { ok: true, resumedGoalId: resumedGoal.id };
   }
   clearGoal(ctx) {
     if (!this.runtime.activeGoal) {
@@ -582,9 +600,14 @@ New goal: ${safeGoalMenuText(objective, 4e3)}`
 // src/lifecycle.ts
 var REMOVED_QUEUE_SETTING_WARNING = "Ordered goal queue has been removed. Use /goal edit to reprioritize an active objective, or start /goal <objectives> if no active goal exists.";
 var REMOVED_PERSISTED_QUEUE_WARNING = "Ordered goal queue has been removed. Start /goal <objectives> to continue with one merged objective, or use /goal clear to discard the old queue state.";
-function registerGoalLifecycle(pi, runtime, runController, commands, options = {}) {
+function registerGoalLifecycle(pi, runtime, runController, commands, stateController, options = {}) {
   let sessionActive = true;
   pi.on("session_start", async (_event, ctx) => {
+    const sessionId = stateController.beginSession();
+    await restoreSession(ctx);
+    if (sessionActive) stateController.ready(ctx, sessionId);
+  });
+  async function restoreSession(ctx) {
     sessionActive = true;
     runtime.bindWorkflowSession(ctx.sessionManager);
     runtime.replaceMenuSession();
@@ -608,13 +631,16 @@ function registerGoalLifecycle(pi, runtime, runController, commands, options = {
     runtime.legacyQueueState = loaded.legacyQueueState;
     runtime.legacyExperimentalGoalsSetting = settingsResult.kind !== "invalid" && settingsResult.legacyExperimentalGoals;
     runController.bindSession(ctx);
+    if (loaded.invalid) {
+      throw new Error("Saved Goal state is invalid; refusing to seed or resume work. Recover the session explicitly.");
+    }
     if (settingsResult.kind === "invalid") {
       notifyTerminal(ctx.ui, `pi-goal settings ignored: ${settingsResult.reason}. Using default settings.`, "warning");
     }
     if (runtime.legacyExperimentalGoalsSetting && !runtime.legacyQueueState) {
       notifyTerminal(ctx.ui, REMOVED_QUEUE_SETTING_WARNING, "warning");
     }
-    if (loaded.goal?.status !== "active") {
+    if (!loaded.hasRecordedState) {
       const initialGoal = process.env.PI_GOAL_INITIAL?.trim();
       if (initialGoal) {
         await commands.startGoal(initialGoal, void 0, ctx);
@@ -624,6 +650,7 @@ function registerGoalLifecycle(pi, runtime, runController, commands, options = {
     if (loaded.goal?.status === "active") {
       if (!runtime.acquireWorkflow()) {
         runtime.activeGoal = transitionGoal(loaded.goal, "paused");
+        runtime.activeGoal.stopCause = "workflow_busy";
         runtime.persistGoal(runtime.activeGoal);
         runtime.ensureInactiveGoalContextContract(ctx);
         runtime.updateStatus(ctx, runtime.activeGoal);
@@ -636,7 +663,13 @@ function registerGoalLifecycle(pi, runtime, runController, commands, options = {
       }
       runtime.activeGoal = loaded.goal;
       if (runtime.activeGoal.safetyResetPending) {
-        runtime.activeGoal = resetGoalSafetyEpoch(runtime.activeGoal);
+        runtime.stopActiveGoal(ctx, {
+          kind: "activation_rollback",
+          expectedGoalId: runtime.activeGoal.id,
+          restoreGoal: { ...runtime.activeGoal, safetyResetPending: void 0 },
+          abortTurn: false
+        });
+        return;
       }
       runtime.recordGoalUsage(runtime.activeGoal, ctx);
       if (runtime.limitActiveGoalForBudget(ctx, false)) return;
@@ -672,9 +705,10 @@ function registerGoalLifecycle(pi, runtime, runController, commands, options = {
       runtime.ensureInactiveGoalContextContract(ctx);
       ctx.ui.setStatus(STATUS_KEY, void 0);
     }
-  });
+  }
   pi.on("session_shutdown", (_event, ctx) => {
     sessionActive = false;
+    stateController.shutdown();
     const shutdownSession = ctx.sessionManager;
     runController.unbindSession();
     runtime.closeMenuSession();
@@ -865,6 +899,24 @@ function registerGoalLifecycle(pi, runtime, runController, commands, options = {
   pi.on("before_agent_start", (event, ctx) => {
     if (!sessionActive) return;
     runtime.clearAgentRun();
+    if (event.messageType === "custom") {
+      if (runtime.hasActiveBudgetWrapUp() && runtime.activeGoal) {
+        runtime.beginAgentRun(runtime.activeGoal.id, "manual");
+        return goalContractBoundaryResult(ctx);
+      }
+      if (runtime.activeGoal?.status === "active" && !runtime.ownsWorkflow(runtime.activeGoal)) {
+        runtime.cancelContinuationWork();
+        runtime.clearGoalRecovery();
+        abortCurrentTurn(ctx);
+        return;
+      }
+      if (runtime.activeGoal?.waiting) runtime.clearGoalWait(ctx, runtime.activeGoal.id);
+      if (runtime.activeGoal?.status === "active" && runtime.ownsWorkflow(runtime.activeGoal)) {
+        runtime.beginAgentRun(runtime.activeGoal.id, "manual");
+        if (!runtime.goalToolsAvailable()) runtime.pauseGoalForUnavailableTools(ctx, false);
+      }
+      return goalContractBoundaryResult(ctx, runtime.activeGoal?.status === "active" ? runtime.activeGoal : void 0);
+    }
     if (runtime.guardAbortGoalId) runtime.guardAbortGoalId = void 0;
     const goalPrompt = runtime.consumeOwnedGoalPrompt(event.prompt);
     const goalPromptGoalId = goalPrompt?.goalId;
@@ -1333,6 +1385,150 @@ var GoalRunController = class {
   }
 };
 
+// src/state-protocol.ts
+import { randomUUID } from "node:crypto";
+var GoalStateController = class {
+  constructor(runtime, commands) {
+    this.runtime = runtime;
+    this.commands = commands;
+    runtime.onStateChanged = () => this.changed();
+  }
+  runtime;
+  commands;
+  sessionId = randomUUID();
+  revision = 0;
+  ctx;
+  available = false;
+  resuming = false;
+  fingerprint = "";
+  register(pi) {
+    pi.events.on("pi-goal:query", (data) => {
+      const requestId = readRequestId(data);
+      if (!requestId) return;
+      this.reply(requestId, "query", { ok: true });
+    });
+    pi.events.on("pi-goal:resume", (data) => this.resume(data));
+  }
+  beginSession() {
+    this.sessionId = randomUUID();
+    this.ctx = void 0;
+    this.available = false;
+    this.resuming = false;
+    this.revision = 0;
+    this.fingerprint = "";
+    this.changed();
+    return this.sessionId;
+  }
+  ready(ctx, sessionId) {
+    if (this.sessionId !== sessionId) return;
+    this.ctx = ctx;
+    this.available = true;
+    this.changed();
+  }
+  shutdown() {
+    this.ctx = void 0;
+    this.available = false;
+    this.changed();
+  }
+  snapshot() {
+    const goal2 = this.available ? this.runtime.activeGoal : void 0;
+    return {
+      version: 1,
+      sessionId: this.sessionId,
+      revision: this.revision,
+      available: this.available,
+      limits: { ...this.runtime.settings.continuationLimits },
+      goal: goal2 ? {
+        goalId: goal2.id,
+        status: goal2.status,
+        automaticModelTurns: goal2.automaticModelTurns,
+        toolFreeRepeatCount: goal2.toolFreeRepeatCount,
+        iteration: goal2.iteration,
+        tokensUsed: goal2.tokensUsed,
+        timeUsedSeconds: goal2.timeUsedSeconds,
+        ...goal2.tokenBudget === void 0 ? {} : { tokenBudget: goal2.tokenBudget },
+        safetyResetPending: goal2.safetyResetPending === true,
+        waiting: goal2.waiting ? {
+          reason: goal2.waiting.reason.startsWith("Provider retries exhausted") ? "Provider retries exhausted" : safeGoalMenuText(goal2.waiting.reason).slice(0, 1e3),
+          ...goal2.waiting.resumeAt === void 0 ? {} : { resumeAt: goal2.waiting.resumeAt },
+          exhausted: this.runtime.isGoalWaitExhausted()
+        } : null,
+        // Never export raw terminal/provider errors. Older stopped records have an unknown cause.
+        stopCause: goal2.status === "active" || goal2.status === "complete" ? null : goal2.stopCause ?? goal2.safetyPauseCause ?? "unknown"
+      } : null
+    };
+  }
+  changed() {
+    const snapshot = this.snapshot();
+    const fingerprint = JSON.stringify({ ...snapshot, revision: 0 });
+    if (fingerprint === this.fingerprint) return;
+    this.fingerprint = fingerprint;
+    snapshot.revision = ++this.revision;
+    queueMicrotask(() => {
+      if (snapshot.sessionId === this.sessionId) this.runtime.pi.events.emit("pi-goal:changed", snapshot);
+    });
+  }
+  reply(requestId, operation, result) {
+    this.changed();
+    this.runtime.pi.events.emit("pi-goal:result", {
+      version: 1,
+      requestId,
+      operation,
+      ...result,
+      snapshot: this.snapshot()
+    });
+  }
+  async resume(data) {
+    const requestId = readRequestId(data);
+    if (!requestId) return;
+    const request = data;
+    if (typeof request.sessionId !== "string" || typeof request.goalId !== "string" || typeof request.expectedStatus !== "string" || !Number.isSafeInteger(request.expectedRevision)) {
+      this.reply(requestId, "resume", { ok: false, code: "INVALID_REQUEST" });
+      return;
+    }
+    this.changed();
+    const ctx = this.ctx;
+    if (!ctx || !this.available) {
+      this.reply(requestId, "resume", { ok: false, code: "NO_ACTIVE_SESSION" });
+      return;
+    }
+    const isCurrent = () => {
+      this.changed();
+      return this.available && this.ctx === ctx && this.sessionId === request.sessionId && this.revision === request.expectedRevision && this.runtime.activeGoal?.id === request.goalId && this.runtime.activeGoal?.status === request.expectedStatus;
+    };
+    if (!isCurrent()) {
+      this.reply(requestId, "resume", { ok: false, code: "STALE_STATE" });
+      return;
+    }
+    if (this.resuming) {
+      this.reply(requestId, "resume", { ok: false, code: "RESUME_IN_PROGRESS" });
+      return;
+    }
+    const sessionId = this.sessionId;
+    this.resuming = true;
+    try {
+      const result = await this.commands.resumeGoal(
+        ctx,
+        isCurrent,
+        () => this.available && this.sessionId === sessionId && this.ctx === ctx
+      );
+      if (this.sessionId !== sessionId || this.ctx !== ctx) return;
+      this.reply(requestId, "resume", result);
+    } catch (error) {
+      if (this.sessionId !== sessionId || this.ctx !== ctx) return;
+      this.reply(requestId, "resume", { ok: false, code: "ACTIVATION_FAILED" });
+      throw error;
+    } finally {
+      if (this.sessionId === sessionId) this.resuming = false;
+    }
+  }
+};
+function readRequestId(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return void 0;
+  const id = Reflect.get(data, "requestId");
+  return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(id) ? id : void 0;
+}
+
 // src/tools.ts
 import {
   DEFAULT_MAX_BYTES,
@@ -1659,10 +1855,12 @@ function registerGoalRuntime(pi, options = {}) {
   const runtime = new GoalRuntime(pi);
   const commands = new GoalCommandController(runtime);
   const runController = new GoalRunController(runtime, commands);
+  const stateController = new GoalStateController(runtime, commands);
   runController.register(pi);
+  stateController.register(pi);
   registerGoalTools(pi, runtime);
   registerGoalCommand(pi, runtime, commands, options);
-  registerGoalLifecycle(pi, runtime, runController, commands, options);
+  registerGoalLifecycle(pi, runtime, runController, commands, stateController, options);
 }
 function goal(pi, options = {}) {
   registerGoalRuntime(pi, options);

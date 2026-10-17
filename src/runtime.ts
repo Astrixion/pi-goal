@@ -196,7 +196,18 @@ const CONTRADICTORY_COMPLETION_PATTERNS = [
 // recovery share one generation-guarded runtime; separating them further would
 // duplicate stale-turn, timer, and persistence invariants across modules.
 export class GoalRuntime {
-  settings: GoalSettings = DEFAULT_GOAL_SETTINGS;
+  private currentSettings: GoalSettings = DEFAULT_GOAL_SETTINGS;
+  onStateChanged?: () => void;
+
+  get settings() {
+    return this.currentSettings;
+  }
+
+  set settings(settings: GoalSettings) {
+    this.currentSettings = settings;
+    this.onStateChanged?.();
+  }
+
   settingsLoadIssue?: GoalSettingsLoadIssue;
   activeGoal?: ActiveGoal;
   /** Terminal details captured for the matching persisted-state snapshot. */
@@ -484,6 +495,11 @@ export class GoalRuntime {
     return true;
   }
 
+  isGoalWaitExhausted() {
+    return this.goalWaitDeadlineRetry?.goalId === this.activeGoal?.id &&
+      this.goalWaitDeadlineRetry?.exhausted === true;
+  }
+
   dispatchDueGoalWait(ctx: StatusContext) {
     const goal = this.activeGoal;
     if (!this.ownsWorkflow(goal)) return false;
@@ -656,6 +672,11 @@ export class GoalRuntime {
     }
 
     this.activeGoal = transitionGoal(goal, status);
+    this.activeGoal.stopCause = request.kind === "safety_pause" ? request.cause
+      : request.kind === "agent_interruption" ? (
+        status === "usage_limited" ? "usage_limit" : status === "paused" ? "interrupted" : "provider_error"
+      )
+      : request.kind === "activation_rollback" ? "activation_failed" : request.kind;
     if (terminalReason !== undefined) this.setTerminalReason(this.activeGoal.id, terminalReason);
     const stoppedGoal = this.activeGoal;
     this.persistGoal(stoppedGoal);
@@ -1166,11 +1187,13 @@ export class GoalRuntime {
       this.clearTerminalDetails();
     }
     this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE, serializeGoalState(goal));
+    this.onStateChanged?.();
     this.publishGoalState(buildGoalStateSnapshot(goal, this.terminalDetails?.summary, this.terminalDetails?.reason));
   }
 
   clearPersistedGoal(cwd: string, clearedGoal?: ActiveGoal, reason = "goal cleared") {
     this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE, serializeGoalState(undefined));
+    this.onStateChanged?.();
     if (clearedGoal) {
       this.publishGoalState({
         goalId: clearedGoal.id,
@@ -1370,6 +1393,7 @@ export function transitionGoal(goal: ActiveGoal, requestedStatus: GoalStatus): A
     ...goal,
     status,
     updatedAt: now,
+    stopCause: status === "active" ? undefined : goal.stopCause,
     ...(status === "active" ? {} : { waiting: undefined }),
   };
   checkpointGoalActiveTime(next, now, status === "active" && !next.waiting);

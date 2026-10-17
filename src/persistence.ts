@@ -11,6 +11,13 @@ const STATE_FILE = join(getAgentDir(), "pi-goal-state.json");
 
 export type SafetyPauseCause = "continuation_limit" | "no_progress";
 
+export const GOAL_STOP_CAUSES = [
+  "continuation_limit", "no_progress", "explicit_pause", "budget_limit", "tools_unavailable",
+  "blocker_report", "interrupted", "provider_error", "usage_limit", "retry_exhausted",
+  "activation_failed", "workflow_busy", "unknown",
+] as const;
+export type GoalStopCause = (typeof GOAL_STOP_CAUSES)[number];
+
 export interface ActiveGoal {
   id: string;
   text: string;
@@ -28,6 +35,7 @@ export interface ActiveGoal {
   lastToolFreeOutputFingerprint?: string;
   safetyPauseCause?: SafetyPauseCause;
   safetyResetPending?: boolean;
+  stopCause?: GoalStopCause;
   waiting?: GoalWait;
 }
 
@@ -46,6 +54,9 @@ export interface LegacyQueueState {
 export interface LoadedGoalState {
   goal: ActiveGoal | undefined;
   legacyQueueState: LegacyQueueState | undefined;
+  /** Includes cleared, completed, legacy and malformed records: none may seed new work. */
+  hasRecordedState?: boolean;
+  invalid?: boolean;
 }
 
 interface SessionEntry {
@@ -70,26 +81,26 @@ export function loadGoalStateFromSession(ctx: SessionContext): LoadedGoalState {
   const canonicalEntry = entries
     .filter((entry) => entry.type === "custom" && entry.customType === GOAL_STATE_ENTRY_TYPE)
     .pop();
-  if (canonicalEntry) return loadCanonicalGoalState(canonicalEntry.data);
+  if (canonicalEntry) return { ...loadCanonicalGoalState(canonicalEntry.data), hasRecordedState: true };
 
   const legacyEntry = entries
     .filter((entry) => entry.type === "custom" && entry.customType === LEGACY_GOALS_STATE_ENTRY_TYPE)
     .pop();
-  return legacyEntry ? loadLegacyGoalsState(legacyEntry.data) : emptyGoalState();
+  return legacyEntry ? { ...loadLegacyGoalsState(legacyEntry.data), hasRecordedState: true } : emptyGoalState();
 }
 
 function loadCanonicalGoalState(data: unknown): LoadedGoalState {
-  if (!isRecord(data)) return emptyGoalState();
+  if (!isRecord(data)) return { ...emptyGoalState(), invalid: true };
   const rawGoal = data.goal;
-  if (rawGoal !== null && !isStoredGoal(rawGoal)) return emptyGoalState();
+  if (rawGoal !== null && !isStoredGoal(rawGoal)) return { ...emptyGoalState(), invalid: true };
   const rawQueue = Object.hasOwn(data, "queue") ? data.queue : undefined;
   if (rawQueue !== undefined && (!Array.isArray(rawQueue) || !rawQueue.every(isQueueGoal))) {
-    return emptyGoalState();
+    return { ...emptyGoalState(), invalid: true };
   }
   const pendingAction = Object.hasOwn(data, "pendingAction")
     ? normalizeCanonicalPendingAction(data.pendingAction)
     : undefined;
-  if (Object.hasOwn(data, "pendingAction") && !pendingAction) return emptyGoalState();
+  if (Object.hasOwn(data, "pendingAction") && !pendingAction) return { ...emptyGoalState(), invalid: true };
   const hasQueueFields = rawQueue !== undefined || pendingAction !== undefined;
   if (hasQueueFields || (isStoredGoal(rawGoal) && rawGoal.status === "queued")) {
     return legacyQueueState({
@@ -180,6 +191,7 @@ export function normalizeLoadedGoal(goal: ActiveGoal): ActiveGoal {
     lastToolFreeOutputFingerprint: normalizeOutputFingerprint(goal.lastToolFreeOutputFingerprint),
     safetyPauseCause: normalizeSafetyPauseCause(goal.safetyPauseCause),
     safetyResetPending: goal.safetyResetPending === true ? true : undefined,
+    stopCause: GOAL_STOP_CAUSES.includes(goal.stopCause as GoalStopCause) ? goal.stopCause : undefined,
     waiting,
   };
 }

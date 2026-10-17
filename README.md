@@ -1,4 +1,33 @@
-> **Astrixion fork.** Derived from [narumiruna/pi-extensions `packages/pi-goal`](https://github.com/narumiruna/pi-extensions) (MIT). Patched to auto-start a standing goal from the `PI_GOAL_INITIAL` environment variable when no active goal is restored, for unattended Room members. `dist/` is committed so the package installs directly from git.
+> **Astrixion fork.** Derived from [narumiruna/pi-extensions `packages/pi-goal`](https://github.com/narumiruna/pi-extensions) (MIT). Seeds `PI_GOAL_INITIAL` only in sessions with no recorded Goal state. Saved stops, clear/completion decisions, and usage survive recovery. `dist/` is committed so the package installs directly from git. Runtime integration targets Pi `1.3.0` and Node `24.22.0`.
+
+## Room runtime integration
+
+The in-process event bus API in [`src/state-protocol.ts`](src/state-protocol.ts) is independent of
+`rpc.enabled` and managed-run ownership. It is available to trusted extensions, not a network API:
+
+- Emit `pi-goal:query` with `{ requestId }`; consume the correlated `pi-goal:result`.
+- Subscribe to `pi-goal:changed` for version-1 snapshots, including restoration, waiting, counters,
+  effective-limit changes, clear, and shutdown. Deduplication compares all exposed fields, not status
+  alone. `sessionId` is a fresh binding identity on each start/reload, not Pi's durable session ID.
+  Revisions increase within that binding. Discard older revisions and old binding identities.
+- Emit `pi-goal:resume` with `{ requestId, sessionId, goalId, expectedStatus, expectedRevision }`.
+  All identity/state fields are required and rechecked after workflow-lock acquisition. Request IDs
+  match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. The reply has `operation: "resume"`, `ok`, a current
+  `snapshot`, and either `resumedGoalId` or a typed `code`. Invalid request IDs are ignored.
+- `ok: true` acknowledges controller acceptance, **not prompt delivery or completed inference**:
+  Pi's extension `sendUserMessage` API returns void. `safetyResetPending` remains true until the owned
+  resume prompt starts. If recovery finds that pending activation, it pauses with `activation_failed`
+  and keeps the counters rather than manufacturing a fresh allowance.
+- Stopped resume rotates Goal identity, retains cumulative usage and conversation, and resets the
+  safety epoch only on prompt start. Waiting resume keeps identity and counters. Exhausted budgets,
+  unavailable tools, workflow conflicts, and stale observations cannot bypass eligibility.
+- Stop causes are durable enum values, never raw provider errors. Older stopped entries without a
+  typed cause report `unknown` (or their existing safety cause). Waiting reasons are display-sanitized
+  member text, not instructions or a source of authority.
+
+Misanthropic sets `{ "continuationLimits": { "automaticTurns": 100, "noProgressTurns": 3 } }` in
+`<PI_CODING_AGENT_DIR>/pi-goal.json` for newly prepared members. The upstream defaults remain 25/3
+for installations without that configuration. No setting or event automatically resumes stopped work.
 
 # 🎯 pi-goal — Keep Pi Working Toward a Goal
 

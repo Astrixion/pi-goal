@@ -417,26 +417,41 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 var GOAL_STATE_ENTRY_TYPE = "goal-state";
 var LEGACY_GOALS_STATE_ENTRY_TYPE = "goals-state";
 var STATE_FILE = join(getAgentDir(), "pi-goal-state.json");
+var GOAL_STOP_CAUSES = [
+  "continuation_limit",
+  "no_progress",
+  "explicit_pause",
+  "budget_limit",
+  "tools_unavailable",
+  "blocker_report",
+  "interrupted",
+  "provider_error",
+  "usage_limit",
+  "retry_exhausted",
+  "activation_failed",
+  "workflow_busy",
+  "unknown"
+];
 function serializeGoalState(goal) {
   return { goal: goal ?? null };
 }
 function loadGoalStateFromSession(ctx) {
   const entries = ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
   const canonicalEntry = entries.filter((entry) => entry.type === "custom" && entry.customType === GOAL_STATE_ENTRY_TYPE).pop();
-  if (canonicalEntry) return loadCanonicalGoalState(canonicalEntry.data);
+  if (canonicalEntry) return { ...loadCanonicalGoalState(canonicalEntry.data), hasRecordedState: true };
   const legacyEntry = entries.filter((entry) => entry.type === "custom" && entry.customType === LEGACY_GOALS_STATE_ENTRY_TYPE).pop();
-  return legacyEntry ? loadLegacyGoalsState(legacyEntry.data) : emptyGoalState();
+  return legacyEntry ? { ...loadLegacyGoalsState(legacyEntry.data), hasRecordedState: true } : emptyGoalState();
 }
 function loadCanonicalGoalState(data) {
-  if (!isRecord2(data)) return emptyGoalState();
+  if (!isRecord2(data)) return { ...emptyGoalState(), invalid: true };
   const rawGoal = data.goal;
-  if (rawGoal !== null && !isStoredGoal(rawGoal)) return emptyGoalState();
+  if (rawGoal !== null && !isStoredGoal(rawGoal)) return { ...emptyGoalState(), invalid: true };
   const rawQueue = Object.hasOwn(data, "queue") ? data.queue : void 0;
   if (rawQueue !== void 0 && (!Array.isArray(rawQueue) || !rawQueue.every(isQueueGoal))) {
-    return emptyGoalState();
+    return { ...emptyGoalState(), invalid: true };
   }
   const pendingAction = Object.hasOwn(data, "pendingAction") ? normalizeCanonicalPendingAction(data.pendingAction) : void 0;
-  if (Object.hasOwn(data, "pendingAction") && !pendingAction) return emptyGoalState();
+  if (Object.hasOwn(data, "pendingAction") && !pendingAction) return { ...emptyGoalState(), invalid: true };
   const hasQueueFields = rawQueue !== void 0 || pendingAction !== void 0;
   if (hasQueueFields || isStoredGoal(rawGoal) && rawGoal.status === "queued") {
     return legacyQueueState({
@@ -510,6 +525,7 @@ function normalizeLoadedGoal(goal) {
     lastToolFreeOutputFingerprint: normalizeOutputFingerprint(goal.lastToolFreeOutputFingerprint),
     safetyPauseCause: normalizeSafetyPauseCause(goal.safetyPauseCause),
     safetyResetPending: goal.safetyResetPending === true ? true : void 0,
+    stopCause: GOAL_STOP_CAUSES.includes(goal.stopCause) ? goal.stopCause : void 0,
     waiting
   };
 }
@@ -726,7 +742,15 @@ var CONTRADICTORY_COMPLETION_PATTERNS = [
   /\btests?\s+(?:still\s+)?fail(?:ing)?\b/i
 ];
 var GoalRuntime = class {
-  settings = DEFAULT_GOAL_SETTINGS;
+  currentSettings = DEFAULT_GOAL_SETTINGS;
+  onStateChanged;
+  get settings() {
+    return this.currentSettings;
+  }
+  set settings(settings) {
+    this.currentSettings = settings;
+    this.onStateChanged?.();
+  }
   settingsLoadIssue;
   activeGoal;
   /** Terminal details captured for the matching persisted-state snapshot. */
@@ -959,6 +983,9 @@ var GoalRuntime = class {
     this.scheduleGoalWaitTimer(ctx, goal.id, resumeAt);
     return true;
   }
+  isGoalWaitExhausted() {
+    return this.goalWaitDeadlineRetry?.goalId === this.activeGoal?.id && this.goalWaitDeadlineRetry?.exhausted === true;
+  }
   dispatchDueGoalWait(ctx) {
     const goal = this.activeGoal;
     if (!this.ownsWorkflow(goal)) return false;
@@ -1115,6 +1142,7 @@ var GoalRuntime = class {
         break;
     }
     this.activeGoal = transitionGoal(goal, status);
+    this.activeGoal.stopCause = request.kind === "safety_pause" ? request.cause : request.kind === "agent_interruption" ? status === "usage_limited" ? "usage_limit" : status === "paused" ? "interrupted" : "provider_error" : request.kind === "activation_rollback" ? "activation_failed" : request.kind;
     if (terminalReason !== void 0) this.setTerminalReason(this.activeGoal.id, terminalReason);
     const stoppedGoal = this.activeGoal;
     this.persistGoal(stoppedGoal);
@@ -1521,10 +1549,12 @@ var GoalRuntime = class {
       this.clearTerminalDetails();
     }
     this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE2, serializeGoalState(goal));
+    this.onStateChanged?.();
     this.publishGoalState(buildGoalStateSnapshot(goal, this.terminalDetails?.summary, this.terminalDetails?.reason));
   }
   clearPersistedGoal(cwd, clearedGoal, reason = "goal cleared") {
     this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE2, serializeGoalState(void 0));
+    this.onStateChanged?.();
     if (clearedGoal) {
       this.publishGoalState({
         goalId: clearedGoal.id,
@@ -1700,6 +1730,7 @@ function transitionGoal(goal, requestedStatus) {
     ...goal,
     status,
     updatedAt: now,
+    stopCause: status === "active" ? void 0 : goal.stopCause,
     ...status === "active" ? {} : { waiting: void 0 }
   };
   checkpointGoalActiveTime(next, now, status === "active" && !next.waiting);
@@ -1884,4 +1915,4 @@ export {
   isContradictoryCompletionSummary,
   goalIdRejectionReason
 };
-//# sourceMappingURL=chunk-7FMBWODN.ts.map
+//# sourceMappingURL=chunk-DSTRZ2SJ.ts.map

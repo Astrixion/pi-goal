@@ -3,7 +3,7 @@
 import {
   goalSummary,
   parseTokenBudget
-} from "./chunk-7FMBWODN.ts";
+} from "./chunk-DSTRZ2SJ.ts";
 import {
   formatDuration,
   formatTokenCount,
@@ -547,4 +547,4 @@ export {
   safeGoalMenuText,
   showGoalManager
 };
-//# sourceMappingURL=menu-7W5HGHFO.ts.map
+//# sourceMappingURL=menu-GVLAPH7N.ts.map
