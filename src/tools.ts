@@ -305,7 +305,6 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
         return reject(`goal is ${activeGoal.status}, not active`);
       }
       if (!runtime.ownsWorkflow(activeGoal)) return reject("active Goal no longer owns its workflow");
-      if (activeGoal.waiting) return reject("goal is already waiting");
       if (!reason) return reject("reason is empty");
       if (reason.length > MAX_GOAL_WAIT_REASON_LENGTH) return reject("reason is too long");
       if (
@@ -313,6 +312,17 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
         (!Number.isInteger(resumeAfterMs) || resumeAfterMs < 1 || resumeAfterMs > MAX_GOAL_WAIT_DELAY_MS)
       ) {
         return reject(`resume_after_ms must be a whole number from 1 to ${MAX_GOAL_WAIT_DELAY_MS}`);
+      }
+
+      if (activeGoal.waiting) {
+        // A repeated wait must settle this turn, not encourage more work or
+        // extend the existing deadline. Pi still delivers queued wake messages.
+        const waiting = activeGoal.waiting;
+        return {
+          content: toolContent(`Goal already waiting: ${waiting.reason}\nExisting wait unchanged.`),
+          details: waitDetails(goal, requestedGoalId, waiting.reason, undefined, waiting.resumeAt),
+          terminate: true,
+        };
       }
 
       const { requestedMs, effectiveMs } = resolveGoalWaitDelay(resumeAfterMs);

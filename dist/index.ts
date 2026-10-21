@@ -600,7 +600,7 @@ New goal: ${safeGoalMenuText(objective, 4e3)}`
 // src/lifecycle.ts
 var REMOVED_QUEUE_SETTING_WARNING = "Ordered goal queue has been removed. Use /goal edit to reprioritize an active objective, or start /goal <objectives> if no active goal exists.";
 var REMOVED_PERSISTED_QUEUE_WARNING = "Ordered goal queue has been removed. Start /goal <objectives> to continue with one merged objective, or use /goal clear to discard the old queue state.";
-function registerGoalLifecycle(pi, runtime, runController, commands, stateController, options = {}) {
+function registerGoalLifecycle(pi, runtime, runController, stateController, options = {}) {
   let sessionActive = true;
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = stateController.beginSession();
@@ -643,8 +643,9 @@ function registerGoalLifecycle(pi, runtime, runController, commands, stateContro
     if (!loaded.hasRecordedState) {
       const initialGoal = process.env.PI_GOAL_INITIAL?.trim();
       if (initialGoal) {
-        await commands.startGoal(initialGoal, void 0, ctx);
-        return;
+        const validationError = validateObjective(initialGoal);
+        if (validationError) throw new Error(`Invalid standing Goal: ${validationError}`);
+        loaded.goal = createGoal(initialGoal, void 0, currentTokenTotal(ctx));
       }
     }
     if (loaded.goal?.status === "active") {
@@ -830,6 +831,9 @@ function registerGoalLifecycle(pi, runtime, runController, commands, stateContro
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(prompt);
     const queuedNonGoalInput = runtime.consumeQueuedNonGoalInput(prompt, !ownedPromptBoundary);
     if (!ownedPrompt) {
+      if (queuedNonGoalInput && !ownedPromptBoundary && runtime.activeGoal?.waiting) {
+        runtime.clearGoalWait(ctx, runtime.activeGoal.id);
+      }
       if (queuedNonGoalInput?.behavior === "followUp") {
         beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
       }
@@ -1765,11 +1769,19 @@ function registerGoalTools(pi, runtime) {
         return reject(`goal is ${activeGoal.status}, not active`);
       }
       if (!runtime.ownsWorkflow(activeGoal)) return reject("active Goal no longer owns its workflow");
-      if (activeGoal.waiting) return reject("goal is already waiting");
       if (!reason) return reject("reason is empty");
       if (reason.length > MAX_GOAL_WAIT_REASON_LENGTH) return reject("reason is too long");
       if (resumeAfterMs !== void 0 && (!Number.isInteger(resumeAfterMs) || resumeAfterMs < 1 || resumeAfterMs > MAX_GOAL_WAIT_DELAY_MS)) {
         return reject(`resume_after_ms must be a whole number from 1 to ${MAX_GOAL_WAIT_DELAY_MS}`);
+      }
+      if (activeGoal.waiting) {
+        const waiting2 = activeGoal.waiting;
+        return {
+          content: toolContent(`Goal already waiting: ${waiting2.reason}
+Existing wait unchanged.`),
+          details: waitDetails(goal2, requestedGoalId, waiting2.reason, void 0, waiting2.resumeAt),
+          terminate: true
+        };
       }
       const { requestedMs, effectiveMs } = resolveGoalWaitDelay(resumeAfterMs);
       const waiting = createGoalWait(reason, resumeAfterMs);
@@ -1860,7 +1872,7 @@ function registerGoalRuntime(pi, options = {}) {
   stateController.register(pi);
   registerGoalTools(pi, runtime);
   registerGoalCommand(pi, runtime, commands, options);
-  registerGoalLifecycle(pi, runtime, runController, commands, stateController, options);
+  registerGoalLifecycle(pi, runtime, runController, stateController, options);
 }
 function goal(pi, options = {}) {
   registerGoalRuntime(pi, options);

@@ -2,6 +2,11 @@
 
 ## Room runtime integration
 
+`PI_GOAL_INITIAL` seeds the active Goal and its context contract without starting a model turn.
+The host owns startup delivery; Misanthropic uses its persisted `member_start` message. Setting this
+variable alone does not start standalone work; use `/goal <objective>` for that. A startup prompt
+must not remain queued behind the host's first turn and wake a Goal that has already chosen to wait.
+
 The in-process event bus API in [`src/state-protocol.ts`](src/state-protocol.ts) is independent of
 `rpc.enabled` and managed-run ownership. It is available to trusted extensions, not a network API:
 
@@ -307,6 +312,9 @@ Omitting `resume_after_ms` intentionally permits an indefinite quiet wait.
 An accepted call keeps the canonical Goal status active, checkpoints active elapsed time, and cancels pending continuation work.
 It persists the reason and optional absolute deadline and terminates the normal single-tool run.
 Call `goal_wait` alone because Pi only guarantees early termination when every finalized result in a parallel tool batch terminates.
+Repeating a valid call for the same waiting Goal also terminates normally, retaining the original
+reason and absolute deadline rather than restarting or extending the wait. Queued external messages
+still wake the Goal when delivered, including messages accepted before the wait began.
 
 When Pi exhausts retries for a transient provider error such as HTTP 429, pi-goal enters the same active waiting state without a deadline instead of marking the Goal blocked.
 The warning reports bounded provider status and explains that a follow-up or `/goal resume` retries the Goal.

@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { currentTokenTotal } from "./accounting.js";
+import { validateObjective } from "./command.js";
 import { notifyTerminal } from "./errors.js";
 import {
   GOAL_CONTRACT_MESSAGE_TYPE,
@@ -9,11 +10,11 @@ import {
 } from "./goal-contract.js";
 import { type ActiveGoal, loadGoalStateFromSession } from "./persistence.js";
 import type { GoalRunController } from "./run-protocol.js";
-import type { GoalCommandController } from "./commands.js";
 import {
   type AssistantMessageLike,
   abortCurrentTurn,
   blocksStaleGoalToolCalls,
+  createGoal,
   findFinalAssistantMessage,
   type GoalRuntime,
   incrementGoal,
@@ -43,7 +44,6 @@ export function registerGoalLifecycle(
   pi: ExtensionAPI,
   runtime: GoalRuntime,
   runController: GoalRunController,
-  commands: GoalCommandController,
   stateController: GoalStateController,
   options: GoalLifecycleOptions = {},
 ) {
@@ -101,8 +101,12 @@ export function registerGoalLifecycle(
     if (!loaded.hasRecordedState) {
       const initialGoal = process.env.PI_GOAL_INITIAL?.trim();
       if (initialGoal) {
-        await commands.startGoal(initialGoal, undefined, ctx);
-        return;
+        const validationError = validateObjective(initialGoal);
+        if (validationError) throw new Error(`Invalid standing Goal: ${validationError}`);
+        // The host's startup message owns the first turn. Seed its Goal contract
+        // through the restore path, without a second queued prompt that could
+        // drain after that turn has deliberately entered goal_wait.
+        loaded.goal = createGoal(initialGoal, undefined, currentTokenTotal(ctx));
       }
     }
 
@@ -330,6 +334,11 @@ export function registerGoalLifecycle(
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(prompt);
     const queuedNonGoalInput = runtime.consumeQueuedNonGoalInput(prompt, !ownedPromptBoundary);
     if (!ownedPrompt) {
+      // Input acceptance can precede goal_wait. Wake at actual delivery too,
+      // without treating an already-claimed Goal prompt as external input.
+      if (queuedNonGoalInput && !ownedPromptBoundary && runtime.activeGoal?.waiting) {
+        runtime.clearGoalWait(ctx, runtime.activeGoal.id);
+      }
       if (queuedNonGoalInput?.behavior === "followUp") {
         beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
       }
